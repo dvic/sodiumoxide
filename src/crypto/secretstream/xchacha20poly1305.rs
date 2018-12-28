@@ -159,6 +159,11 @@ impl<M: StreamMode> Stream<M> {
     pub fn is_finalized(&self) -> bool {
         self.finalized
     }
+
+    /// Returns true if the stream is not finalized.
+    pub fn is_not_finalized(&self) -> bool {
+        !self.finalized
+    }
 }
 
 impl Stream<Push> {
@@ -312,6 +317,9 @@ impl Stream<Pull> {
             return Err(());
         }
         let tag = Tag::from_u8(tag)?;
+        if tag == Tag::Final {
+            self.finalized = true;
+        }
         Ok((buf, tag))
     }
 }
@@ -349,7 +357,18 @@ mod test {
     use randombytes::randombytes_into;
 
     #[test]
-    fn test_push_pull() {
+    fn decrypt_too_short_ciphertext() {
+        let ciphertext: [u8; (ABYTES - 1)] = unsafe { mem::uninitialized() };
+        let key = gen_key();
+        let (_, header) = Stream::init_push(&key).unwrap();
+        let mut stream = Stream::init_pull(&header, &key).unwrap();
+        // TODO: when custom error types are introduced, this should assert the
+        // specific error.
+        assert!(stream.pull(&ciphertext, None).is_err());
+    }
+
+    #[test]
+    fn push_pull() {
         let mut msg1 = [0; 128];
         let mut msg2 = [0; 34];
         let mut msg3 = [0; 478];
@@ -359,26 +378,177 @@ mod test {
         randombytes_into(&mut msg3);
 
         let key = gen_key();
-        let (mut state, header) = Stream::init_push(&key).unwrap();
-        let c1 = state.push(&msg1, None, Tag::Message).unwrap();
-        assert!(!state.is_finalized());
-        let c2 = state.push(&msg2, None, Tag::Push).unwrap();
-        assert!(!state.is_finalized());
-        let c3 = state.push(&msg3, None, Tag::Final).unwrap();
-        assert!(state.is_finalized());
+        let (mut stream, header) = Stream::init_push(&key).unwrap();
+        let c1 = stream.push(&msg1, None, Tag::Message).unwrap();
+        assert!(stream.is_not_finalized());
+        let c2 = stream.push(&msg2, None, Tag::Push).unwrap();
+        assert!(stream.is_not_finalized());
+        let c3 = stream.push(&msg3, None, Tag::Final).unwrap();
+        assert!(stream.is_finalized());
 
-        let mut state = Stream::init_pull(&header, &key).unwrap();
+        let mut stream = Stream::init_pull(&header, &key).unwrap();
+        assert!(stream.is_not_finalized());
 
-        let (m1, t1) = state.pull(&c1, None).unwrap();
+        let (m1, t1) = stream.pull(&c1, None).unwrap();
         assert_eq!(t1, Tag::Message);
         assert_eq!(msg1[..], m1[..]);
 
-        let (m2, t2) = state.pull(&c2, None).unwrap();
+        let (m2, t2) = stream.pull(&c2, None).unwrap();
         assert_eq!(t2, Tag::Push);
         assert_eq!(msg2[..], m2[..]);
 
-        let (m3, t3) = state.pull(&c3, None).unwrap();
+        let (m3, t3) = stream.pull(&c3, None).unwrap();
         assert_eq!(t3, Tag::Final);
         assert_eq!(msg3[..], m3[..]);
     }
+
+    #[test]
+    fn push_pull_with_ad() {
+        let mut msg1 = [0; 128];
+        let mut msg2 = [0; 34];
+        let mut msg3 = [0; 478];
+        let mut ad1 = [0; 224];
+        let mut ad2 = [0; 135];
+
+        randombytes_into(&mut msg1);
+        randombytes_into(&mut msg2);
+        randombytes_into(&mut msg3);
+        randombytes_into(&mut ad1);
+        randombytes_into(&mut ad2);
+
+        let key = gen_key();
+        let (mut stream, header) = Stream::init_push(&key).unwrap();
+        let c1 = stream.push(&msg1, Some(&ad1), Tag::Message).unwrap();
+        let c2 = stream.push(&msg2, Some(&ad2), Tag::Push).unwrap();
+        let c3 = stream.push(&msg3, None, Tag::Final).unwrap();
+
+        let mut stream = Stream::init_pull(&header, &key).unwrap();
+        assert!(stream.is_not_finalized());
+
+        let (m1, t1) = stream.pull(&c1, Some(&ad1)).unwrap();
+        assert_eq!(t1, Tag::Message);
+        assert_eq!(msg1[..], m1[..]);
+        assert!(stream.is_not_finalized());
+
+        let (m2, t2) = stream.pull(&c2, Some(&ad2)).unwrap();
+        assert_eq!(t2, Tag::Push);
+        assert_eq!(msg2[..], m2[..]);
+        assert!(stream.is_not_finalized());
+
+        let (m3, t3) = stream.pull(&c3, None).unwrap();
+        assert_eq!(t3, Tag::Final);
+        assert_eq!(msg3[..], m3[..]);
+        assert!(stream.is_finalized());
+    }
+
+    #[test]
+    fn push_pull_with_rekey() {
+        let mut msg1 = [0; 128];
+        let mut msg2 = [0; 34];
+        let mut msg3 = [0; 478];
+
+        randombytes_into(&mut msg1);
+        randombytes_into(&mut msg2);
+        randombytes_into(&mut msg3);
+
+        let key = gen_key();
+        let (mut stream, header) = Stream::init_push(&key).unwrap();
+        let c1 = stream.push(&msg1, None, Tag::Message).unwrap();
+        let c2 = stream.push(&msg2, None, Tag::Rekey).unwrap();
+        let c3 = stream.push(&msg3, None, Tag::Final).unwrap();
+
+        let mut stream = Stream::init_pull(&header, &key).unwrap();
+        assert!(stream.is_not_finalized());
+
+        let (m1, t1) = stream.pull(&c1, None).unwrap();
+        assert_eq!(t1, Tag::Message);
+        assert_eq!(msg1[..], m1[..]);
+        assert!(stream.is_not_finalized());
+
+        let (m2, t2) = stream.pull(&c2, None).unwrap();
+        assert_eq!(t2, Tag::Rekey);
+        assert_eq!(msg2[..], m2[..]);
+        assert!(stream.is_not_finalized());
+
+        let (m3, t3) = stream.pull(&c3, None).unwrap();
+        assert_eq!(t3, Tag::Final);
+        assert_eq!(msg3[..], m3[..]);
+        assert!(stream.is_finalized());
+    }
+
+    fn push_pull_with_explicit_rekey() {
+        let mut msg1 = [0; 128];
+        let mut msg2 = [0; 34];
+        let mut msg3 = [0; 478];
+
+        randombytes_into(&mut msg1);
+        randombytes_into(&mut msg2);
+        randombytes_into(&mut msg3);
+
+        let key = gen_key();
+        let (mut stream, header) = Stream::init_push(&key).unwrap();
+        let c1 = stream.push(&msg1, None, Tag::Message).unwrap();
+        let c2 = stream.push(&msg2, None, Tag::Push).unwrap();
+        stream.rekey();
+        let c3 = stream.push(&msg3, None, Tag::Final).unwrap();
+
+        let mut stream = Stream::init_pull(&header, &key).unwrap();
+        assert!(stream.is_not_finalized());
+
+        let (m1, t1) = stream.pull(&c1, None).unwrap();
+        assert_eq!(t1, Tag::Message);
+        assert_eq!(msg1[..], m1[..]);
+        assert!(stream.is_not_finalized());
+
+        let (m2, t2) = stream.pull(&c2, None).unwrap();
+        assert_eq!(t2, Tag::Push);
+        assert_eq!(msg2[..], m2[..]);
+        assert!(stream.is_not_finalized());
+
+        stream.rekey().unwrap();
+        assert!(stream.is_not_finalized());
+
+        let (m3, t3) = stream.pull(&c3, None).unwrap();
+        assert_eq!(t3, Tag::Final);
+        assert_eq!(msg3[..], m3[..]);
+        assert!(stream.is_finalized());
+    }
+
+    #[test]
+    fn cannot_pull_after_finalization() {
+        let m = [0; 128];
+        let key = gen_key();
+        let (mut stream, header) = Stream::init_push(&key).unwrap();
+        let c = stream.push(&m, None, Tag::Final).unwrap();
+        let mut stream = Stream::init_pull(&header, &key).unwrap();
+        assert!(stream.is_not_finalized());
+        stream.pull(&c, None).unwrap();
+        // TODO: check specific `Err(())` when implemented (#221).
+        assert!(stream.pull(&c, None).is_err());
+    }
+
+    #[test]
+    fn cannot_rekey_after_finalization() {
+        let m = [0; 128];
+        let key = gen_key();
+        let (mut stream, header) = Stream::init_push(&key).unwrap();
+        let c = stream.push(&m, None, Tag::Final).unwrap();
+        let mut stream = Stream::init_pull(&header, &key).unwrap();
+        assert!(stream.is_not_finalized());
+        stream.pull(&c, None).unwrap();
+        // TODO: check specific `Err(())` when implemented (#221).
+        assert!(stream.rekey().is_err());
+    }
+
+    #[test]
+    fn tag_from_u8() {
+        assert_eq!(Tag::Message, Tag::from_u8(0).unwrap());
+        assert_eq!(Tag::Push, Tag::from_u8(1).unwrap());
+        assert_eq!(Tag::Rekey, Tag::from_u8(2).unwrap());
+        assert_eq!(Tag::Final, Tag::from_u8(3).unwrap());
+        for i in 4..(u16::from(std::u8::MAX) + 1) {
+            assert!(Tag::from_u8(i as u8).is_err());
+        }
+    }
+
 }
